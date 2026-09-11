@@ -82,7 +82,7 @@ index 16e9118d1f..bbf7e35324 100644
              command: description,
              exitCode,
 diff --git a/packages/opencode/src/tool/shell.ts b/packages/opencode/src/tool/shell.ts
-index 1e4423e017..c548f7c252 100644
+index 1e4423e017..b514e2ff18 100644
 --- a/packages/opencode/src/tool/shell.ts
 +++ b/packages/opencode/src/tool/shell.ts
 @@ -1,4 +1,4 @@
@@ -91,7 +91,32 @@ index 1e4423e017..c548f7c252 100644
  import os from "os"
  import { createWriteStream } from "node:fs"
  import * as Tool from "./tool"
-@@ -483,7 +483,10 @@ export const ShellTool = Tool.define(
+@@ -290,8 +290,24 @@ const ask = Effect.fn("ShellTool.ask")(function* (ctx: Tool.Context, scan: Scan,
+   })
+ })
+ 
++// fix(win32-start-process): single-side RedirectStandardOutput/Error leaves the
++// other pipe inherited. A long-lived child (python sink, adb server,
++// serve_forever) holding it keeps the parent pwsh from exiting, so the
++// tool waits the full 120s timeout even with exit-first semantics.
++// Auto-complete the missing side to $null so the parent can exit;
++// callers needing the stream should pass both redirects explicitly.
++function normalizeWin32PsCommand(command: string): string {
++  if (!/Start-Process/i.test(command)) return command
++  const hasOut = /-RedirectStandardOutput\b/i.test(command)
++  const hasErr = /-RedirectStandardError\b/i.test(command)
++  if (hasOut === hasErr) return command
++  if (hasOut && !hasErr) return command + ' -RedirectStandardError "$null"'
++  return command + ' -RedirectStandardOutput "$null"'
++}
++
+ function cmd(shell: string, command: string, cwd: string, env: NodeJS.ProcessEnv) {
+   if (process.platform === "win32" && Shell.ps(shell)) {
++    command = normalizeWin32PsCommand(command)
+     return ChildProcess.make(shell, ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", command], {
+       cwd,
+       env,
+@@ -483,7 +499,10 @@ export const ShellTool = Tool.define(
            yield* Effect.addFinalizer(closeSink)
            const handle = yield* spawner.spawn(cmd(input.shell, input.command, input.cwd, input.env))
  
@@ -103,7 +128,7 @@ index 1e4423e017..c548f7c252 100644
              Stream.runForEach(Stream.decodeText(handle.all), (chunk) => {
                const size = Buffer.byteLength(chunk, "utf-8")
                list.push({ text: chunk, size })
-@@ -554,6 +557,13 @@ export const ShellTool = Tool.define(
+@@ -554,6 +573,13 @@ export const ShellTool = Tool.define(
              yield* handle.kill({ forceKillAfter: "3 seconds" }).pipe(Effect.orDie)
            }
  
