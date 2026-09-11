@@ -1,0 +1,63 @@
+name: win32-close-fix-build
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build-win32:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout upstream opencode v1.18.18
+        uses: actions/checkout@v4
+        with:
+          repository: sst/opencode
+          ref: v1.18.18
+          path: upstream
+
+      - name: Checkout fix patch
+        uses: actions/checkout@v4
+        with:
+          path: fixrepo
+
+      - name: Apply win32 close-vs-exit patch
+        shell: pwsh
+        run: |
+          Get-Content fixrepo/win32-fix.patch | Select-Object -First 20
+          git -C upstream apply --check ../fixrepo/win32-fix.patch
+          git -C upstream apply ../fixrepo/win32-fix.patch
+          git -C upstream diff --stat
+
+      - name: Setup bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.14
+
+      - name: Typecheck core
+        shell: pwsh
+        working-directory: upstream/packages/core
+        run: bun run typecheck
+
+      - name: Typecheck opencode
+        shell: pwsh
+        working-directory: upstream/packages/opencode
+        run: bun run typecheck
+
+      - name: Test core shell
+        shell: pwsh
+        working-directory: upstream/packages/core
+        run: bun test test/shell.test.ts test/tool-bash.test.ts --timeout 30000 --only-failures
+
+      - name: Build win32 x64 single
+        shell: pwsh
+        working-directory: upstream/packages/opencode
+        env:
+          OPENCODE_CHANNEL: latest
+        run: bun run script/build.ts --single --skip-embed-web-ui
+
+      - name: Upload win32 binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: opencode-windows-x64-fixed
+          path: upstream/packages/opencode/dist/opencode-windows-x64/bin/opencode.exe
+          if-no-files-found: error
