@@ -1,0 +1,119 @@
+diff --git a/packages/core/src/cross-spawn-spawner.ts b/packages/core/src/cross-spawn-spawner.ts
+index 6ea9022acf..dcc7b7ff78 100644
+--- a/packages/core/src/cross-spawn-spawner.ts
++++ b/packages/core/src/cross-spawn-spawner.ts
+@@ -273,8 +273,18 @@ export const make = Effect.gen(function* () {
+       proc.on("error", (err) => {
+         resume(Effect.fail(toPlatformError("spawn", err, command)))
+       })
++      // fix(win32-close-vs-exit): exit-first, not close-first.
++      // Node emits `exit` when the process ends and `close` when stdio
++      // pipes are closed. A grandchild holding an inherited pipe
++      // (Start-Process single-side redirect, adb server, python sink)
++      // delays `close` indefinitely. Resolving on `exit` gives
++      // Claude-style exit semantics; streams drain separately
++      // with a bounded grace period.
+       proc.on("exit", (...args) => {
+         exit = args
++        if (end) return
++        end = true
++        Deferred.doneUnsafe(signal, Exit.succeed(args))
+       })
+       proc.on("close", (...args) => {
+         if (end) return
+diff --git a/packages/core/src/process.ts b/packages/core/src/process.ts
+index 16e9118d1f..bbf7e35324 100644
+--- a/packages/core/src/process.ts
++++ b/packages/core/src/process.ts
+@@ -141,16 +141,30 @@ const layer = Layer.effect(
+   Effect.gen(function* () {
+     const spawner = yield* ChildProcessSpawner
+ 
++    const DRAIN_GRACE_MS = 2000
++    const drainOrEmpty = <A, E, R>(stream: Effect.Effect<A, E, R>): Effect.Effect<A, never, R> =>
++      stream.pipe(
++        Effect.timeoutOrElse({
++          duration: Duration.millis(DRAIN_GRACE_MS),
++          // Pipe held by a detached grandchild (win32 Start-Process
++          // single-side redirect, adb server): exit already arrived,
++          // don't wait for close/EOF forever. Truncate and settle.
++          orElse: () => Effect.succeed({ buffer: Buffer.alloc(0), truncated: true } as unknown as A),
++        }),
++        Effect.catch(() => Effect.succeed({ buffer: Buffer.alloc(0), truncated: true } as unknown as A)),
++      )
+     const runCommand = (command: ChildProcess.Command, options?: RunOptions) => {
+       const description = describeCommand(command)
+       const collect = Effect.scoped(
+         Effect.gen(function* () {
+           const handle = yield* spawner.spawn(command)
+           if (options?.combineOutput) {
+-            const [output, exitCode] = yield* Effect.all(
+-              [collectStream(handle.all, options.maxOutputBytes), handle.exitCode],
+-              { concurrency: "unbounded" },
+-            )
++            // exit-first: don't let a leaked pipe block exitCode (close vs exit).
++            const exitCode = yield* handle.exitCode
++            const output = (yield* drainOrEmpty(collectStream(handle.all, options.maxOutputBytes))) as unknown as {
++              buffer: Buffer
++              truncated: boolean
++            }
+             return {
+               command: description,
+               exitCode,
+@@ -162,14 +176,15 @@ const layer = Layer.effect(
+               stderrTruncated: false,
+             } satisfies RunResult
+           }
+-          const [stdout, stderr, exitCode] = yield* Effect.all(
++          // exit-first + bounded drain (see above).
++          const exitCode = yield* handle.exitCode
++          const [stdout, stderr] = (yield* Effect.all(
+             [
+-              collectStream(handle.stdout, options?.maxOutputBytes),
+-              collectStream(handle.stderr, options?.maxErrorBytes),
+-              handle.exitCode,
++              drainOrEmpty(collectStream(handle.stdout, options?.maxOutputBytes)),
++              drainOrEmpty(collectStream(handle.stderr, options?.maxErrorBytes)),
+             ],
+             { concurrency: "unbounded" },
+-          )
++          )) as unknown as [{ buffer: Buffer; truncated: boolean }, { buffer: Buffer; truncated: boolean }]
+           return {
+             command: description,
+             exitCode,
+diff --git a/packages/opencode/src/tool/shell.ts b/packages/opencode/src/tool/shell.ts
+index 1e4423e017..c548f7c252 100644
+--- a/packages/opencode/src/tool/shell.ts
++++ b/packages/opencode/src/tool/shell.ts
+@@ -1,4 +1,4 @@
+-import { Effect, Stream } from "effect"
++import { Duration, Effect, Fiber, Stream } from "effect"
+ import os from "os"
+ import { createWriteStream } from "node:fs"
+ import * as Tool from "./tool"
+@@ -483,7 +483,10 @@ export const ShellTool = Tool.define(
+           yield* Effect.addFinalizer(closeSink)
+           const handle = yield* spawner.spawn(cmd(input.shell, input.command, input.cwd, input.env))
+ 
+-          yield* Effect.forkScoped(
++          // Bounded drain: forkScoped would otherwise keep Effect.scoped
++          // open forever when a grandchild holds the pipe (close vs exit).
++          // Capture the fiber so we can interrupt it after exit/kill.
++          const drain = yield* Effect.forkScoped(
+             Stream.runForEach(Stream.decodeText(handle.all), (chunk) => {
+               const size = Buffer.byteLength(chunk, "utf-8")
+               list.push({ text: chunk, size })
+@@ -554,6 +557,13 @@ export const ShellTool = Tool.define(
+             yield* handle.kill({ forceKillAfter: "3 seconds" }).pipe(Effect.orDie)
+           }
+ 
++          // Give drain a brief grace to flush, then interrupt so scoped can
++          // settle even if close/EOF never arrives (leaked pipe).
++          yield* Fiber.interrupt(drain).pipe(
++            Effect.timeoutOption(Duration.millis(500)),
++            Effect.ignore,
++          )
++
+           return exit.kind === "exit" ? exit.code : null
+         }),
+       ).pipe(Effect.orDie)
